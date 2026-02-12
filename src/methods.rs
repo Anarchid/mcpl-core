@@ -388,11 +388,11 @@ pub struct ChannelsPublishResult {
 /// channels/incoming (Server → Host, Request)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelsIncomingParams {
-    pub messages: Vec<IncomingMessage>,
+    pub messages: Vec<IncomingChannelMessage>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IncomingMessage {
+pub struct IncomingChannelMessage {
     #[serde(rename = "channelId")]
     pub channel_id: String,
     #[serde(rename = "messageId")]
