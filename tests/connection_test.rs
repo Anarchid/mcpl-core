@@ -1,5 +1,5 @@
 use mcpl_core::capabilities::*;
-use mcpl_core::connection::McplConnection;
+use mcpl_core::connection::{ConnectionError, McplConnection};
 use mcpl_core::methods::*;
 use mcpl_core::types::*;
 
@@ -51,7 +51,7 @@ async fn test_capability_negotiation() {
     let client_handle = tokio::spawn(async move {
         let result = client
             .send_request(
-                "initialize",
+                method::INITIALIZE,
                 Some(serde_json::to_value(&init_params).unwrap()),
             )
             .await
@@ -374,5 +374,126 @@ async fn test_content_block_serialization() {
             assert_eq!(mime_type.unwrap(), "image/png");
         }
         _ => panic!("Expected Image"),
+    }
+}
+
+#[tokio::test]
+async fn test_from_parts() {
+    // from_parts with tokio::io::duplex simulates stdio/pipe transport
+    let (client_read, server_write) = tokio::io::duplex(4096);
+    let (server_read, client_write) = tokio::io::duplex(4096);
+
+    let mut client = McplConnection::from_parts(
+        Box::new(client_read),
+        Box::new(client_write),
+    );
+    let mut server = McplConnection::from_parts(
+        Box::new(server_read),
+        Box::new(server_write),
+    );
+
+    // Send a notification through the pipe
+    client
+        .send_notification("test/hello", Some(serde_json::json!({"from": "client"})))
+        .await
+        .unwrap();
+
+    let msg = server.next_message().await.unwrap();
+    match msg {
+        mcpl_core::connection::IncomingMessage::Notification(notif) => {
+            assert_eq!(notif.method, "test/hello");
+            let p: serde_json::Value = notif.params.unwrap();
+            assert_eq!(p["from"], "client");
+        }
+        _ => panic!("Expected notification"),
+    }
+}
+
+#[tokio::test]
+async fn test_close_returns_error() {
+    let (client_read, _server_write) = tokio::io::duplex(4096);
+    let (_server_read, client_write) = tokio::io::duplex(4096);
+
+    let mut client = McplConnection::from_parts(
+        Box::new(client_read),
+        Box::new(client_write),
+    );
+
+    // Drop server side — client should get Closed on next_message
+    drop(_server_write);
+
+    let err = client.next_message().await.unwrap_err();
+    assert!(matches!(err, ConnectionError::Closed));
+}
+
+#[tokio::test]
+async fn test_incoming_messages_buffered_during_send_request() {
+    let (mut client, mut server) = connected_pair().await;
+
+    // Server sends a request to the client (which the client hasn't called
+    // next_message for), then the client sends its own request. The server's
+    // request should be buffered and available after the client's request
+    // completes.
+
+    // 1. Client sends a request
+    let client_handle = tokio::spawn(async move {
+        let result = client
+            .send_request("test/echo", Some(serde_json::json!({"n": 1})))
+            .await
+            .unwrap();
+        (client, result)
+    });
+
+    // 2. Server receives the client's request
+    let msg = server.next_message().await.unwrap();
+    let req_id = match &msg {
+        mcpl_core::connection::IncomingMessage::Request(req) => {
+            assert_eq!(req.method, "test/echo");
+            req.id.clone()
+        }
+        _ => panic!("Expected request"),
+    };
+
+    // 3. Before responding, server fires a push event AT the client
+    //    This message arrives while client is blocked in send_request
+    let event_params = PushEventParams {
+        feature_set: "game".into(),
+        event_id: "tick_42".into(),
+        timestamp: "2026-02-12T00:00:00Z".into(),
+        origin: None,
+        payload: PushEventPayload {
+            content: vec![ContentBlock::text("Game tick 42")],
+        },
+    };
+    // Send as a notification (doesn't need response) to avoid deadlock
+    server
+        .send_notification(
+            method::PUSH_EVENT,
+            Some(serde_json::to_value(&event_params).unwrap()),
+        )
+        .await
+        .unwrap();
+
+    // 4. Now server responds to the original request
+    server
+        .send_response(req_id, serde_json::json!({"echo": true}))
+        .await
+        .unwrap();
+
+    // 5. Client gets its response
+    let (mut client, result) = client_handle.await.unwrap();
+    assert_eq!(result["echo"], true);
+
+    // 6. The push event notification should be available via next_message
+    //    (buffered, not dropped!)
+    let buffered = client.next_message().await.unwrap();
+    match buffered {
+        mcpl_core::connection::IncomingMessage::Notification(notif) => {
+            assert_eq!(notif.method, method::PUSH_EVENT);
+            let p: PushEventParams =
+                serde_json::from_value(notif.params.unwrap()).unwrap();
+            assert_eq!(p.event_id, "tick_42");
+        }
+        _ => panic!("Expected buffered notification, got request"),
     }
 }

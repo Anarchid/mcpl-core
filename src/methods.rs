@@ -472,6 +472,7 @@ pub struct IncomingMessageResult {
 // ── Method name constants ──
 
 pub mod method {
+    pub const INITIALIZE: &str = "initialize";
     pub const FEATURE_SETS_UPDATE: &str = "featureSets/update";
     pub const FEATURE_SETS_CHANGED: &str = "featureSets/changed";
     pub const SCOPE_ELEVATE: &str = "scope/elevate";

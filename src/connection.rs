@@ -1,9 +1,7 @@
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::collections::VecDeque;
 
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
-use tokio::sync::oneshot;
 
 use crate::types::*;
 
@@ -19,12 +17,11 @@ pub enum ConnectionError {
     Timeout,
     #[error("RPC error {code}: {message}")]
     Rpc { code: i32, message: String },
-    #[error("Unexpected response for id {0:?}")]
-    UnexpectedResponse(JsonRpcId),
+    #[error("Unrecognized JSON-RPC message: {0}")]
+    UnrecognizedMessage(String),
 }
 
-/// Incoming message from the remote side — either a request/notification that
-/// needs handling, or a response to one of our pending requests.
+/// Incoming message from the remote side — either a request or notification.
 #[derive(Debug)]
 pub enum IncomingMessage {
     Request(JsonRpcRequest),
@@ -35,11 +32,14 @@ pub enum IncomingMessage {
 ///
 /// Messages are framed as newline-delimited JSON (one JSON object per line).
 /// Transport-agnostic: works over TCP, stdio, or any async reader/writer pair.
+///
+/// Incoming messages received while `send_request` is waiting for a response
+/// are buffered and returned by subsequent `next_message` calls.
 pub struct McplConnection {
     writer: Box<dyn AsyncWrite + Unpin + Send>,
     reader: BufReader<Box<dyn AsyncRead + Unpin + Send>>,
-    next_id: AtomicI64,
-    pending: HashMap<JsonRpcId, oneshot::Sender<JsonRpcResponse>>,
+    next_id: i64,
+    incoming_buffer: VecDeque<IncomingMessage>,
 }
 
 impl McplConnection {
@@ -54,8 +54,8 @@ impl McplConnection {
         Self {
             writer: Box::new(write_half),
             reader: BufReader::new(Box::new(read_half) as Box<dyn AsyncRead + Unpin + Send>),
-            next_id: AtomicI64::new(1),
-            pending: HashMap::new(),
+            next_id: 1,
+            incoming_buffer: VecDeque::new(),
         }
     }
 
@@ -67,22 +67,23 @@ impl McplConnection {
         Self {
             writer,
             reader: BufReader::new(reader),
-            next_id: AtomicI64::new(1),
-            pending: HashMap::new(),
+            next_id: 1,
+            incoming_buffer: VecDeque::new(),
         }
     }
 
     /// Send a JSON-RPC request and wait for the response.
+    ///
+    /// Incoming requests and notifications that arrive while waiting are
+    /// buffered and returned by subsequent [`next_message`] calls.
     pub async fn send_request(
         &mut self,
         method: &str,
         params: Option<serde_json::Value>,
     ) -> Result<serde_json::Value, ConnectionError> {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let id = self.next_id;
+        self.next_id += 1;
         let request = JsonRpcRequest::new(id, method, params);
-
-        let (tx, _rx) = oneshot::channel();
-        self.pending.insert(JsonRpcId::Number(id), tx);
 
         self.write_message(&JsonRpcMessage::Request(request)).await?;
 
@@ -99,16 +100,12 @@ impl McplConnection {
                         }
                         return Ok(resp.result.unwrap_or(serde_json::Value::Null));
                     }
-                    // Response for a different request — route it
-                    if let Some(sender) = self.pending.remove(&resp.id) {
-                        let _ = sender.send(resp);
-                    }
+                    // Response for a different request — discard (no concurrent callers)
+                    tracing::warn!("Received response for unknown id {:?}", resp.id);
                 }
                 InternalMessage::Incoming(msg) => {
-                    // We got an incoming request/notification while waiting for our response.
-                    // In a simple single-task usage this shouldn't happen, but for robustness
-                    // we could buffer these. For now, log and drop.
-                    tracing::warn!("Received incoming message while waiting for response: {:?}", msg);
+                    // Buffer incoming requests/notifications for next_message()
+                    self.incoming_buffer.push_back(msg);
                 }
             }
         }
@@ -153,14 +150,20 @@ impl McplConnection {
     }
 
     /// Read the next incoming request or notification.
-    /// Responses to our pending requests are routed internally.
+    ///
+    /// Drains any messages buffered during `send_request` before reading
+    /// from the wire.
     pub async fn next_message(&mut self) -> Result<IncomingMessage, ConnectionError> {
+        // Drain buffered messages first
+        if let Some(buffered) = self.incoming_buffer.pop_front() {
+            return Ok(buffered);
+        }
+
         loop {
             match self.read_next_internal().await? {
                 InternalMessage::Response(resp) => {
-                    if let Some(sender) = self.pending.remove(&resp.id) {
-                        let _ = sender.send(resp);
-                    }
+                    // Unexpected response (no pending request) — discard
+                    tracing::warn!("Received response for unknown id {:?}", resp.id);
                 }
                 InternalMessage::Incoming(msg) => return Ok(msg),
             }
@@ -209,10 +212,7 @@ impl McplConnection {
                 let notification: JsonRpcNotification = serde_json::from_value(value)?;
                 return Ok(InternalMessage::Incoming(IncomingMessage::Notification(notification)));
             } else {
-                tracing::warn!("Unrecognized JSON-RPC message: {}", trimmed);
-                return Err(ConnectionError::Json(
-                    serde_json::from_str::<()>(trimmed).unwrap_err(),
-                ));
+                return Err(ConnectionError::UnrecognizedMessage(trimmed.to_string()));
             }
         }
     }

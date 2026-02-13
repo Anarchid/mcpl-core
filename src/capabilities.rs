@@ -134,11 +134,11 @@ impl McplCapabilities {
     }
 
     pub fn has_inference_request(&self) -> bool {
-        self.inference_request.as_ref().map_or(false, |c| c.is_enabled())
+        self.inference_request.as_ref().is_some_and(|c| c.is_enabled())
     }
 
     pub fn has_inference_streaming(&self) -> bool {
-        self.inference_request.as_ref().map_or(false, |c| c.supports_streaming())
+        self.inference_request.as_ref().is_some_and(|c| c.supports_streaming())
     }
 
     pub fn has_model_info(&self) -> bool {
