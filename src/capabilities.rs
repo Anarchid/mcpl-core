@@ -12,17 +12,49 @@ pub struct McplCapabilities {
     #[serde(rename = "contextHooks", default, skip_serializing_if = "Option::is_none")]
     pub context_hooks: Option<ContextHooksCap>,
     #[serde(rename = "inferenceRequest", default, skip_serializing_if = "Option::is_none")]
-    pub inference_request: Option<bool>,
+    pub inference_request: Option<InferenceRequestCap>,
     #[serde(rename = "streamObserver", default, skip_serializing_if = "Option::is_none")]
     pub stream_observer: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rollback: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub channels: Option<bool>,
+    #[serde(rename = "modelInfo", default, skip_serializing_if = "Option::is_none")]
+    pub model_info: Option<bool>,
     #[serde(rename = "featureSets", default, skip_serializing_if = "Option::is_none")]
     pub feature_sets: Option<Vec<FeatureSetDeclaration>>,
     #[serde(rename = "scopedAccess", default, skip_serializing_if = "Option::is_none")]
     pub scoped_access: Option<bool>,
+}
+
+/// The `inferenceRequest` capability can be a simple boolean `true` or
+/// an object `{ streaming: bool }` for finer-grained control.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum InferenceRequestCap {
+    Simple(bool),
+    Detailed(InferenceRequestDetail),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InferenceRequestDetail {
+    pub streaming: bool,
+}
+
+impl InferenceRequestCap {
+    pub fn is_enabled(&self) -> bool {
+        match self {
+            InferenceRequestCap::Simple(b) => *b,
+            InferenceRequestCap::Detailed(_) => true,
+        }
+    }
+
+    pub fn supports_streaming(&self) -> bool {
+        match self {
+            InferenceRequestCap::Simple(_) => false,
+            InferenceRequestCap::Detailed(d) => d.streaming,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -102,7 +134,15 @@ impl McplCapabilities {
     }
 
     pub fn has_inference_request(&self) -> bool {
-        self.inference_request.unwrap_or(false)
+        self.inference_request.as_ref().map_or(false, |c| c.is_enabled())
+    }
+
+    pub fn has_inference_streaming(&self) -> bool {
+        self.inference_request.as_ref().map_or(false, |c| c.supports_streaming())
+    }
+
+    pub fn has_model_info(&self) -> bool {
+        self.model_info.unwrap_or(false)
     }
 
     pub fn has_stream_observer(&self) -> bool {

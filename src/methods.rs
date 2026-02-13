@@ -90,6 +90,49 @@ pub struct StateRollbackResult {
     pub reason: Option<String>,
 }
 
+/// State checkpoint metadata (Section 8.2).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StateCheckpoint {
+    pub id: String,
+    #[serde(rename = "featureSet")]
+    pub feature_set: String,
+    pub timestamp: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+/// JSON Patch operation (RFC 6902) for host-managed state (Section 8.3).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JsonPatchOperation {
+    pub op: JsonPatchOp,
+    pub path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum JsonPatchOp {
+    Add,
+    Remove,
+    Replace,
+    Move,
+    Copy,
+    Test,
+}
+
+/// State included in tool results when hostState is enabled.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostManagedState {
+    pub checkpoint: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub patch: Option<Vec<JsonPatchOperation>>,
+}
+
 // ── Push Events (Section 9) ──
 
 /// push/event (Server → Host, Request)
