@@ -497,3 +497,286 @@ async fn test_incoming_messages_buffered_during_send_request() {
         _ => panic!("Expected buffered notification, got request"),
     }
 }
+
+#[tokio::test]
+async fn test_state_update_roundtrip() {
+    let (mut client, mut server) = connected_pair().await;
+
+    // Server sends state/update to host
+    let params = StateUpdateParams {
+        feature_set: "game".into(),
+        checkpoint: "cp_002".into(),
+        parent: Some("cp_001".into()),
+        data: None,
+        patch: Some(vec![JsonPatchOperation {
+            op: JsonPatchOp::Replace,
+            path: "/score".into(),
+            value: Some(serde_json::json!(42)),
+            from: None,
+        }]),
+    };
+
+    let server_handle = tokio::spawn(async move {
+        let result = server
+            .send_request(
+                method::STATE_UPDATE,
+                Some(serde_json::to_value(&params).unwrap()),
+            )
+            .await
+            .unwrap();
+        let update_result: StateUpdateResult = serde_json::from_value(result).unwrap();
+        (server, update_result)
+    });
+
+    let msg = client.next_message().await.unwrap();
+    match msg {
+        mcpl_core::connection::IncomingMessage::Request(req) => {
+            assert_eq!(req.method, "state/update");
+            let p: StateUpdateParams = serde_json::from_value(req.params.unwrap()).unwrap();
+            assert_eq!(p.feature_set, "game");
+            assert_eq!(p.checkpoint, "cp_002");
+            assert_eq!(p.parent, Some("cp_001".into()));
+            assert!(p.data.is_none());
+            let patch = p.patch.unwrap();
+            assert_eq!(patch.len(), 1);
+            assert_eq!(patch[0].path, "/score");
+
+            let result = StateUpdateResult {
+                accepted: true,
+                reason: None,
+            };
+            client
+                .send_response(req.id, serde_json::to_value(&result).unwrap())
+                .await
+                .unwrap();
+        }
+        _ => panic!("Expected request"),
+    }
+
+    let (_server, update_result) = server_handle.await.unwrap();
+    assert!(update_result.accepted);
+}
+
+#[tokio::test]
+async fn test_state_get_roundtrip() {
+    let (mut client, mut server) = connected_pair().await;
+
+    let server_handle = tokio::spawn(async move {
+        let result = server
+            .send_request(
+                method::STATE_GET,
+                Some(serde_json::json!({"featureSet": "game"})),
+            )
+            .await
+            .unwrap();
+        let get_result: StateGetResult = serde_json::from_value(result).unwrap();
+        (server, get_result)
+    });
+
+    let msg = client.next_message().await.unwrap();
+    match msg {
+        mcpl_core::connection::IncomingMessage::Request(req) => {
+            assert_eq!(req.method, "state/get");
+            let p: StateGetParams = serde_json::from_value(req.params.unwrap()).unwrap();
+            assert_eq!(p.feature_set, "game");
+
+            let result = StateGetResult {
+                checkpoint: Some("cp_002".into()),
+                data: serde_json::json!({"score": 42, "units": ["tank", "scout"]}),
+            };
+            client
+                .send_response(req.id, serde_json::to_value(&result).unwrap())
+                .await
+                .unwrap();
+        }
+        _ => panic!("Expected request"),
+    }
+
+    let (_server, get_result) = server_handle.await.unwrap();
+    assert_eq!(get_result.checkpoint, Some("cp_002".into()));
+    assert_eq!(get_result.data["score"], 42);
+}
+
+#[tokio::test]
+async fn test_branches_lifecycle() {
+    let (mut client, mut server) = connected_pair().await;
+
+    // Server requests branch creation
+    let create_params = BranchesCreateParams {
+        feature_set: "game".into(),
+        name: "experiment".into(),
+        from: Some("main".into()),
+        at_checkpoint: None,
+    };
+
+    let server_handle = tokio::spawn(async move {
+        let result = server
+            .send_request(
+                method::BRANCHES_CREATE,
+                Some(serde_json::to_value(&create_params).unwrap()),
+            )
+            .await
+            .unwrap();
+        let create_result: BranchesCreateResult = serde_json::from_value(result).unwrap();
+        (server, create_result)
+    });
+
+    let msg = client.next_message().await.unwrap();
+    match msg {
+        mcpl_core::connection::IncomingMessage::Request(req) => {
+            assert_eq!(req.method, "branches/create");
+            let p: BranchesCreateParams = serde_json::from_value(req.params.unwrap()).unwrap();
+            assert_eq!(p.name, "experiment");
+            assert_eq!(p.from, Some("main".into()));
+
+            let result = BranchesCreateResult {
+                accepted: true,
+                name: Some("experiment".into()),
+                head: Some(0),
+                reason: None,
+            };
+            client
+                .send_response(req.id, serde_json::to_value(&result).unwrap())
+                .await
+                .unwrap();
+        }
+        _ => panic!("Expected request"),
+    }
+
+    let (mut server, create_result) = server_handle.await.unwrap();
+    assert!(create_result.accepted);
+    assert_eq!(create_result.name.unwrap(), "experiment");
+
+    // Server lists branches
+    let list_handle = tokio::spawn(async move {
+        let result = server
+            .send_request(
+                method::BRANCHES_LIST,
+                Some(serde_json::json!({"featureSet": "game"})),
+            )
+            .await
+            .unwrap();
+        let list_result: BranchesListResult = serde_json::from_value(result).unwrap();
+        (server, list_result)
+    });
+
+    let msg = client.next_message().await.unwrap();
+    match msg {
+        mcpl_core::connection::IncomingMessage::Request(req) => {
+            assert_eq!(req.method, "branches/list");
+
+            let result = BranchesListResult {
+                branches: vec![
+                    BranchInfo {
+                        name: "main".into(),
+                        head: 5,
+                        is_current: false,
+                        parent: None,
+                        branch_point: None,
+                    },
+                    BranchInfo {
+                        name: "experiment".into(),
+                        head: 5,
+                        is_current: true,
+                        parent: Some("main".into()),
+                        branch_point: Some(5),
+                    },
+                ],
+            };
+            client
+                .send_response(req.id, serde_json::to_value(&result).unwrap())
+                .await
+                .unwrap();
+        }
+        _ => panic!("Expected request"),
+    }
+
+    let (mut server, list_result) = list_handle.await.unwrap();
+    assert_eq!(list_result.branches.len(), 2);
+    assert_eq!(list_result.branches[1].name, "experiment");
+    assert!(list_result.branches[1].is_current);
+    assert_eq!(list_result.branches[1].parent, Some("main".into()));
+
+    // Host sends branches/changed notification
+    let changed = BranchesChangedParams {
+        event: BranchesChangedEvent::Switched,
+        branch: "main".into(),
+        previous: Some("experiment".into()),
+        head: Some(5),
+        parent: None,
+    };
+    client
+        .send_notification(
+            method::BRANCHES_CHANGED,
+            Some(serde_json::to_value(&changed).unwrap()),
+        )
+        .await
+        .unwrap();
+
+    let msg = server.next_message().await.unwrap();
+    match msg {
+        mcpl_core::connection::IncomingMessage::Notification(notif) => {
+            assert_eq!(notif.method, "branches/changed");
+            let p: BranchesChangedParams = serde_json::from_value(notif.params.unwrap()).unwrap();
+            assert_eq!(p.branch, "main");
+            assert_eq!(p.previous, Some("experiment".into()));
+            match p.event {
+                BranchesChangedEvent::Switched => {}
+                other => panic!("Expected Switched, got {:?}", other),
+            }
+        }
+        _ => panic!("Expected notification"),
+    }
+}
+
+#[tokio::test]
+async fn test_websocket_transport() {
+    use tokio::sync::mpsc;
+
+    // Simulate a WebSocket pair using channels
+    let (client_to_server_tx, client_to_server_rx) = mpsc::unbounded_channel::<String>();
+    let (server_to_client_tx, server_to_client_rx) = mpsc::unbounded_channel::<String>();
+
+    let mut client = McplConnection::from_websocket(server_to_client_rx, client_to_server_tx);
+    let mut server = McplConnection::from_websocket(client_to_server_rx, server_to_client_tx);
+
+    // Send a notification from client to server
+    client
+        .send_notification("test/ws", Some(serde_json::json!({"transport": "websocket"})))
+        .await
+        .unwrap();
+
+    let msg = server.next_message().await.unwrap();
+    match msg {
+        mcpl_core::connection::IncomingMessage::Notification(notif) => {
+            assert_eq!(notif.method, "test/ws");
+            let p: serde_json::Value = notif.params.unwrap();
+            assert_eq!(p["transport"], "websocket");
+        }
+        _ => panic!("Expected notification"),
+    }
+
+    // Request/response over WebSocket
+    let client_handle = tokio::spawn(async move {
+        let result = client
+            .send_request("test/echo", Some(serde_json::json!({"msg": "hello ws"})))
+            .await
+            .unwrap();
+        (client, result)
+    });
+
+    let msg = server.next_message().await.unwrap();
+    match msg {
+        mcpl_core::connection::IncomingMessage::Request(req) => {
+            assert_eq!(req.method, "test/echo");
+            server
+                .send_response(req.id, serde_json::json!({"echoed": true}))
+                .await
+                .unwrap();
+        }
+        _ => panic!("Expected request"),
+    }
+
+    let (_client, result) = client_handle.await.unwrap();
+    assert_eq!(result["echoed"], true);
+}

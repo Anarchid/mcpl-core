@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
+use tokio::sync::mpsc;
 
 use crate::types::*;
 
@@ -70,6 +71,60 @@ impl McplConnection {
             next_id: 1,
             incoming_buffer: VecDeque::new(),
         }
+    }
+
+    /// Create from WebSocket-like message channels.
+    ///
+    /// Bridges message-based transports (like WebSocket) to the line-based
+    /// protocol. Incoming JSON-RPC messages arrive on `incoming_rx`, outgoing
+    /// messages are sent to `outgoing_tx`.
+    ///
+    /// Spawns two bridging tasks on the current tokio runtime.
+    pub fn from_websocket(
+        mut incoming_rx: mpsc::UnboundedReceiver<String>,
+        outgoing_tx: mpsc::UnboundedSender<String>,
+    ) -> Self {
+        let (incoming_read, mut incoming_write) = tokio::io::duplex(8192);
+        let (outgoing_read, outgoing_write) = tokio::io::duplex(8192);
+
+        // Bridge: WS incoming messages → connection reader
+        tokio::spawn(async move {
+            while let Some(msg) = incoming_rx.recv().await {
+                let line = format!("{}\n", msg);
+                if incoming_write.write_all(line.as_bytes()).await.is_err() {
+                    break;
+                }
+                if incoming_write.flush().await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        // Bridge: connection writer → WS outgoing messages
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(outgoing_read);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line).await {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        let trimmed = line.trim().to_string();
+                        if !trimmed.is_empty() {
+                            if outgoing_tx.send(trimmed).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        Self::from_parts(
+            Box::new(incoming_read),
+            Box::new(outgoing_write),
+        )
     }
 
     /// Send a JSON-RPC request and wait for the response.

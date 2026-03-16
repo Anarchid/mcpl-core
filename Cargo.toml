@@ -2,7 +2,7 @@
 name = "mcpl-core"
 version = "0.1.0"
 edition = "2021"
-description = "MCPL v0.4 wire protocol types and async TCP transport"
+description = "MCPL v0.5 wire protocol types and async TCP transport"
 license = "MIT"
 
 [dependencies]

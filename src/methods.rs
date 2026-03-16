@@ -88,6 +88,44 @@ pub struct StateRollbackResult {
     pub success: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Full state at the rolled-back checkpoint (for host-managed state).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<serde_json::Value>,
+}
+
+/// state/update (Server → Host, Request)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StateUpdateParams {
+    #[serde(rename = "featureSet")]
+    pub feature_set: String,
+    pub checkpoint: String,
+    pub parent: Option<String>,
+    /// Full state (mutually exclusive with patch). Both absent = opaque checkpoint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<serde_json::Value>,
+    /// JSON Patch delta from parent (mutually exclusive with data).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub patch: Option<Vec<JsonPatchOperation>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StateUpdateResult {
+    pub accepted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// state/get (Server → Host, Request)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StateGetParams {
+    #[serde(rename = "featureSet")]
+    pub feature_set: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StateGetResult {
+    pub checkpoint: Option<String>,
+    pub data: serde_json::Value,
 }
 
 /// State checkpoint metadata (Section 8.2).
@@ -469,6 +507,126 @@ pub struct IncomingMessageResult {
     pub conversation_id: Option<String>,
 }
 
+// ── Branches (Section 15) ──
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BranchInfo {
+    pub name: String,
+    pub head: u64,
+    #[serde(rename = "isCurrent")]
+    pub is_current: bool,
+    pub parent: Option<String>,
+    #[serde(rename = "branchPoint")]
+    pub branch_point: Option<u64>,
+}
+
+/// branches/list (Server → Host, Request)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BranchesListParams {
+    #[serde(rename = "featureSet")]
+    pub feature_set: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BranchesListResult {
+    pub branches: Vec<BranchInfo>,
+}
+
+/// branches/current (Server → Host, Request)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BranchesCurrentParams {
+    #[serde(rename = "featureSet")]
+    pub feature_set: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BranchesCurrentResult {
+    pub name: String,
+    pub head: u64,
+}
+
+/// branches/create (Server → Host, Request)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BranchesCreateParams {
+    #[serde(rename = "featureSet")]
+    pub feature_set: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    #[serde(rename = "atCheckpoint", skip_serializing_if = "Option::is_none")]
+    pub at_checkpoint: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BranchesCreateResult {
+    pub accepted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub head: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// branches/switch (Server → Host, Request)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BranchesSwitchParams {
+    #[serde(rename = "featureSet")]
+    pub feature_set: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BranchesSwitchResult {
+    pub accepted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub head: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// branches/delete (Server → Host, Request)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BranchesDeleteParams {
+    #[serde(rename = "featureSet")]
+    pub feature_set: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BranchesDeleteResult {
+    pub accepted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// branches/changed (Host → Server, Notification)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BranchesChangedParams {
+    pub event: BranchesChangedEvent,
+    pub branch: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub head: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BranchesChangedEvent {
+    Created,
+    Switched,
+    Deleted,
+}
+
 // ── Method name constants ──
 
 pub mod method {
@@ -476,6 +634,8 @@ pub mod method {
     pub const FEATURE_SETS_UPDATE: &str = "featureSets/update";
     pub const FEATURE_SETS_CHANGED: &str = "featureSets/changed";
     pub const SCOPE_ELEVATE: &str = "scope/elevate";
+    pub const STATE_UPDATE: &str = "state/update";
+    pub const STATE_GET: &str = "state/get";
     pub const STATE_ROLLBACK: &str = "state/rollback";
     pub const PUSH_EVENT: &str = "push/event";
     pub const CONTEXT_BEFORE_INFERENCE: &str = "context/beforeInference";
@@ -492,4 +652,10 @@ pub mod method {
     pub const CHANNELS_OUTGOING_COMPLETE: &str = "channels/outgoing/complete";
     pub const CHANNELS_PUBLISH: &str = "channels/publish";
     pub const CHANNELS_INCOMING: &str = "channels/incoming";
+    pub const BRANCHES_LIST: &str = "branches/list";
+    pub const BRANCHES_CURRENT: &str = "branches/current";
+    pub const BRANCHES_CREATE: &str = "branches/create";
+    pub const BRANCHES_SWITCH: &str = "branches/switch";
+    pub const BRANCHES_DELETE: &str = "branches/delete";
+    pub const BRANCHES_CHANGED: &str = "branches/changed";
 }
