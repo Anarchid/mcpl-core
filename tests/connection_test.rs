@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use mcpl_core::capabilities::*;
 use mcpl_core::connection::{ConnectionError, McplConnection};
 use mcpl_core::methods::*;
@@ -26,10 +28,9 @@ async fn test_capability_negotiation() {
 
     // Client sends initialize request
     let client_caps = McplCapabilities {
-        version: "0.4".into(),
+        version: "0.5".into(),
         push_events: Some(true),
-        channels: Some(true),
-        rollback: Some(true),
+        channels: Some(ChannelsCap::Simple(true)),
         ..Default::default()
     };
 
@@ -69,27 +70,30 @@ async fn test_capability_negotiation() {
                 serde_json::from_value(req.params.unwrap()).unwrap();
             assert_eq!(params.client_info.name, "test-client");
 
+            let mut declared = BTreeMap::new();
+            declared.insert(
+                "lobby".to_string(),
+                FeatureSetDeclaration {
+                    description: "Lobby operations".into(),
+                    uses: vec!["channels.publish".into(), "pushEvents".into()],
+                    rollback: false,
+                    tag_ontology: None,
+                },
+            );
+            declared.insert(
+                "game".to_string(),
+                FeatureSetDeclaration {
+                    description: "Game operations".into(),
+                    uses: vec!["tools".into(), "channels.incoming".into()],
+                    rollback: true,
+                    tag_ontology: None,
+                },
+            );
             let server_caps = McplCapabilities {
-                version: "0.4".into(),
+                version: "0.5".into(),
                 push_events: Some(true),
-                channels: Some(true),
-                rollback: Some(true),
-                feature_sets: Some(vec![
-                    FeatureSetDeclaration {
-                        name: "lobby".into(),
-                        description: Some("Lobby operations".into()),
-                        uses: vec!["connect".into(), "chat".into()],
-                        rollback: false,
-                        host_state: false,
-                    },
-                    FeatureSetDeclaration {
-                        name: "game".into(),
-                        description: Some("Game operations".into()),
-                        uses: vec!["commands".into(), "observation".into()],
-                        rollback: true,
-                        host_state: false,
-                    },
-                ]),
+                channels: Some(ChannelsCap::Simple(true)),
+                feature_sets: Some(FeatureSetsAdvertisement::Declared(declared)),
                 ..Default::default()
             };
 
@@ -123,15 +127,16 @@ async fn test_capability_negotiation() {
         .unwrap()
         .mcpl
         .unwrap();
-    assert!(mcpl.has_push_events());
-    assert!(mcpl.has_channels());
-    assert!(mcpl.has_rollback());
-    let fs = mcpl.feature_sets.unwrap();
+    // Advertisement expands recursively into §6.2 capability paths (§5.1).
+    assert!(mcpl.advertises("pushEvents"));
+    assert!(mcpl.advertises("channels.streaming"), "`channels: true` is shorthand for every leaf");
+    assert!(!mcpl.advertises("modelInfo"), "absence is denial, never default-allow");
+
+    let fs = mcpl.declarations().expect("server form");
     assert_eq!(fs.len(), 2);
-    assert_eq!(fs[0].name, "lobby");
-    assert!(!fs[0].rollback);
-    assert_eq!(fs[1].name, "game");
-    assert!(fs[1].rollback);
+    assert!(!fs["lobby"].rollback);
+    assert!(fs["game"].rollback);
+    assert_eq!(fs["lobby"].description, "Lobby operations");
 }
 
 #[tokio::test]
@@ -139,10 +144,11 @@ async fn test_notification_roundtrip() {
     let (mut client, mut server) = connected_pair().await;
 
     // Client sends notification
+    // §6.7: a Notification is valid only for purely descriptive metadata that does
+    // not alter the grant — hence no `effectiveCapabilities` here.
     let params = FeatureSetsUpdateParams {
         enabled: Some(vec!["lobby".into(), "game".into()]),
-        disabled: None,
-        scopes: None,
+        ..Default::default()
     };
 
     client
@@ -179,6 +185,10 @@ async fn test_push_event_request() {
         payload: PushEventPayload {
             content: vec![ContentBlock::text("User joined lobby")],
         },
+        tags: Some(vec![
+            mcpl_core::tags::chat::AMBIENT.into(),
+            mcpl_core::tags::chat::FROM_HUMAN.into(),
+        ]),
     };
 
     let server_handle = tokio::spawn(async move {
@@ -201,6 +211,11 @@ async fn test_push_event_request() {
             let p: PushEventParams = serde_json::from_value(req.params.unwrap()).unwrap();
             assert_eq!(p.feature_set, "lobby");
             assert_eq!(p.event_id, "evt_001");
+            // RFC-001 §3 / SPEC §16.1: tags survive the wire round-trip.
+            assert_eq!(
+                p.tags.as_deref(),
+                Some(&["chat:ambient".to_string(), "chat:from-human".to_string()][..])
+            );
 
             let result = PushEventResult {
                 accepted: true,
@@ -354,11 +369,7 @@ async fn test_content_block_serialization() {
     let json = serde_json::to_value(&text).unwrap();
     assert_eq!(json, serde_json::json!({"type": "text", "text": "Hello"}));
 
-    let image = ContentBlock::Image {
-        data: Some("base64data".into()),
-        uri: None,
-        mime_type: Some("image/png".into()),
-    };
+    let image = ContentBlock::image(MediaSource::inline("base64data", "image/png"));
     let json = serde_json::to_value(&image).unwrap();
     assert_eq!(
         json,
@@ -368,13 +379,18 @@ async fn test_content_block_serialization() {
     // Roundtrip
     let deserialized: ContentBlock = serde_json::from_value(json).unwrap();
     match deserialized {
-        ContentBlock::Image { data, uri, mime_type } => {
-            assert_eq!(data.unwrap(), "base64data");
-            assert!(uri.is_none());
-            assert_eq!(mime_type.unwrap(), "image/png");
+        ContentBlock::Image(MediaSource::Inline(media)) => {
+            assert_eq!(media.data, "base64data");
+            assert_eq!(media.mime_type, "image/png");
         }
-        _ => panic!("Expected Image"),
+        other => panic!("Expected an inline image, got {other:?}"),
     }
+
+    // App. B.1's `oneOf`: `{data, uri}` together is not a content block.
+    assert!(serde_json::from_value::<ContentBlock>(serde_json::json!({
+        "type": "image", "data": "base64data", "mimeType": "image/png", "uri": "https://x.test/a"
+    }))
+    .is_err());
 }
 
 #[tokio::test]
@@ -464,6 +480,7 @@ async fn test_incoming_messages_buffered_during_send_request() {
         payload: PushEventPayload {
             content: vec![ContentBlock::text("Game tick 42")],
         },
+        tags: None,
     };
     // Send as a notification (doesn't need response) to avoid deadlock
     server

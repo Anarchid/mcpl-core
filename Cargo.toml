@@ -7,7 +7,11 @@ license = "MIT"
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
+# `preserve_order` is deliberately NOT enabled: the canonical digest (SPEC §17.2)
+# re-sorts object members itself, so map iteration order must not matter.
 serde_json = "1.0"
+# SPEC §17.2 canonical manifest digest.
+sha2 = "0.10"
 tokio = { version = "1", features = ["net", "io-util", "sync", "macros", "rt"] }
 thiserror = "1.0"
 tracing = "0.1"
