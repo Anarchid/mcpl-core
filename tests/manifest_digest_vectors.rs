@@ -165,8 +165,7 @@ fn every_set_sort_vector_matches() {
         // library code.
         let mut obj = serde_json::Map::new();
         obj.insert("uses".to_string(), Value::Array(input));
-        sort_set_field(&mut obj, "uses")
-            .unwrap_or_else(|e| panic!("sort vector {name}: unexpected error {e}"));
+        sort_set_field(&mut obj, "uses");
         let actual: Vec<&str> = obj["uses"]
             .as_array()
             .expect("sort_set_field keeps the field an array")

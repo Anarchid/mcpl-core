@@ -94,10 +94,6 @@ pub enum Disposition {
 pub enum DigestError {
     #[error("manifest must be a JSON object")]
     NotAnObject,
-    /// A set-like array contained a non-string element. Set ordering is defined
-    /// over UTF-8 byte sequences, which only exists for strings.
-    #[error("set-like field `{0}` contains a non-string element")]
-    SetElementNotString(String),
     /// A string in an identifier position is empty or contains a character outside
     /// `[A-Za-z0-9._:*-]` (§17.2).
     ///
@@ -119,7 +115,6 @@ impl DigestError {
     pub fn code(&self) -> &'static str {
         match self {
             DigestError::NotAnObject => "manifest_not_object",
-            DigestError::SetElementNotString(_) => "set_member_not_string",
             DigestError::IdentifierCharset { .. } => "identifier_charset",
             DigestError::NumberNotRepresentable(_) => "number_not_representable",
         }
@@ -157,7 +152,7 @@ pub fn canonical_manifest_json(manifest: &Manifest) -> Result<String, DigestErro
         // that name is ordinary content and is hashed.
         .remove("revision");
     validate_identifiers(&stripped)?;
-    normalize_sets(&mut stripped)?;
+    normalize_sets(&mut stripped);
     let mut out = String::new();
     write_jcs(&stripped, &mut out)?;
     Ok(out)
@@ -296,15 +291,21 @@ fn validate_feature_sets_identifiers(feature_sets: &serde_json::Value) -> Result
     Ok(())
 }
 
-/// Check every string element of an array-valued identifier position.
+/// Check every element of an array-valued identifier position.
 ///
-/// Non-string elements are skipped here so that a set-valued array carrying one
-/// still reports `set_member_not_string` from [`normalize_sets`] rather than being
-/// masked by a charset complaint.
+/// The check applies only when the array is well-formed (all elements are
+/// strings). An array carrying any non-string member is non-conforming input:
+/// per §17.2's totality rule it is hashed **verbatim** — no set sort, no dedupe,
+/// and no identifier check — and rejected later by validation, never by the
+/// digest. The identifier refusal exists solely to keep the UTF-8/UTF-16 sort
+/// divergence unreachable, and an unsorted array cannot diverge.
 fn check_string_array(path: &str, value: Option<&serde_json::Value>) -> Result<(), DigestError> {
     let Some(items) = value.and_then(|v| v.as_array()) else {
         return Ok(());
     };
+    if !items.iter().all(|item| item.is_string()) {
+        return Ok(());
+    }
     for item in items {
         if let Some(s) = item.as_str() {
             check_identifier(&format!("{path}[]"), s)?;
@@ -388,7 +389,7 @@ struct CanonicalParts {
 fn canonical_parts(manifest: &Manifest) -> Result<CanonicalParts, DigestError> {
     let obj = manifest.as_object().ok_or(DigestError::NotAnObject)?;
     let mut normalized = serde_json::Value::Object(obj.clone());
-    normalize_sets(&mut normalized)?;
+    normalize_sets(&mut normalized);
     let normalized = normalized
         .as_object()
         .expect("still an object")
@@ -453,9 +454,9 @@ fn canonical_parts(manifest: &Manifest) -> Result<CanonicalParts, DigestError> {
 // depth, so an unrelated extension array that happens to be called `uses` keeps its
 // order (§17.2: "any array not listed is a list; its order is part of the manifest").
 
-fn normalize_sets(manifest: &mut serde_json::Value) -> Result<(), DigestError> {
+fn normalize_sets(manifest: &mut serde_json::Value) {
     let Some(feature_sets) = manifest.get_mut("featureSets") else {
-        return Ok(());
+        return;
     };
     // §17.2's set paths are written against the object form's `featureSets.*.uses`
     // (SPEC §5.1/§6.1/§8.1, RFC-003). Any other shape — including RFC-001's
@@ -465,63 +466,60 @@ fn normalize_sets(manifest: &mut serde_json::Value) -> Result<(), DigestError> {
     // where the shape fails; the digest's job is to give two implementations the
     // same answer for the same bytes.
     let Some(map) = feature_sets.as_object_mut() else {
-        return Ok(());
+        return;
     };
     for (_, decl) in map.iter_mut() {
-        normalize_feature_set(decl)?;
+        normalize_feature_set(decl);
     }
-    Ok(())
 }
 
-fn normalize_feature_set(decl: &mut serde_json::Value) -> Result<(), DigestError> {
+fn normalize_feature_set(decl: &mut serde_json::Value) {
     let Some(obj) = decl.as_object_mut() else {
-        return Ok(());
+        return;
     };
-    sort_set_field(obj, "uses")?;
+    sort_set_field(obj, "uses");
 
     let Some(ontology) = obj.get_mut("tagOntology").and_then(|v| v.as_object_mut()) else {
-        return Ok(());
+        return;
     };
-    sort_set_field(ontology, "coreTags")?;
+    sort_set_field(ontology, "coreTags");
 
     if let Some(tags) = ontology.get_mut("tags").and_then(|v| v.as_object_mut()) {
         for (_, descriptor) in tags.iter_mut() {
             if let Some(descriptor) = descriptor.as_object_mut() {
-                sort_set_field(descriptor, "implies")?;
+                sort_set_field(descriptor, "implies");
             }
         }
     }
-    Ok(())
 }
 
 /// Sort one set-valued field of `obj` in place: UTF-8 byte order ascending,
 /// duplicates removed (§17.2 / RFC-003 §3.1).
 ///
 /// The digest is **total**: set semantics apply only when the value actually *is*
-/// an array. A wrong-typed value in a set position (`"uses": "tools"`) is left
-/// untouched and hashed verbatim — validation (§6.4 `invalid_uses`) is where wrong
-/// types fail, not the digest.
+/// an array **and every element is a string**. A wrong-typed value in a set
+/// position (`"uses": "tools"`), or a set-declared array carrying any non-string
+/// member (`"uses": [1]`), is left untouched and hashed verbatim — no sort, no
+/// dedupe. Validation (§6.4 `invalid_uses`) is where non-conforming input fails,
+/// not the digest.
 ///
 /// Public so the shared conformance sort vectors exercise this exact comparator
 /// rather than a test-local reimplementation of it.
-pub fn sort_set_field(
-    obj: &mut serde_json::Map<String, serde_json::Value>,
-    field: &str,
-) -> Result<(), DigestError> {
+pub fn sort_set_field(obj: &mut serde_json::Map<String, serde_json::Value>, field: &str) {
     let Some(value) = obj.get_mut(field) else {
-        return Ok(());
+        return;
     };
     let Some(array) = value.as_array() else {
-        return Ok(());
+        return;
     };
 
     let mut items: Vec<&str> = Vec::with_capacity(array.len());
     for element in array {
-        items.push(
-            element
-                .as_str()
-                .ok_or_else(|| DigestError::SetElementNotString(field.to_string()))?,
-        );
+        let Some(s) = element.as_str() else {
+            // Non-conforming set member: hash the array verbatim (§17.2 totality).
+            return;
+        };
+        items.push(s);
     }
     // Sort by UTF-8 byte sequence ascending. Rust's `str: Ord` is exactly that.
     items.sort_unstable();
@@ -533,7 +531,6 @@ pub fn sort_set_field(
             .map(|s| serde_json::Value::String(s.to_string()))
             .collect(),
     );
-    Ok(())
 }
 
 // ── RFC 8785 (JCS) ────────────────────────────────────────────────────────────
@@ -803,15 +800,18 @@ mod tests {
         .unwrap();
         assert!(canonical.contains(r#""uses":"tools""#), "{canonical}");
 
-        // A set-valued *array* carrying a non-string element still fails: set
-        // ordering is defined over UTF-8 byte sequences, which only exist for
-        // strings.
-        let err = manifest_revision(&json!({
+        // Second totality corollary: a set-DECLARED array carrying any non-string
+        // member is likewise hashed verbatim — no sort, no dedupe, no identifier
+        // check. Order and the duplicate are preserved; the digest never refuses.
+        let canonical = canonical_manifest_json(&json!({
             "version": "0.5",
-            "featureSets": { "f": { "description": "d", "uses": ["tools", 7] } }
+            "featureSets": { "f": { "description": "d", "uses": ["tools", 7, "pushEvents", "tools"] } }
         }))
-        .unwrap_err();
-        assert_eq!(err, DigestError::SetElementNotString("uses".into()));
+        .unwrap();
+        assert!(
+            canonical.contains(r#""uses":["tools",7,"pushEvents","tools"]"#),
+            "{canonical}"
+        );
     }
 
     #[test]

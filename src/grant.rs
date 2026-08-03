@@ -90,6 +90,10 @@ pub fn channel_method_capability(method: &str) -> Option<&'static str> {
 /// - Members that are not part of the §6.2 vocabulary (`version`, `revision`,
 ///   `featureSets`, and any extension member) contribute nothing. Advertisement
 ///   cannot mint a path the vocabulary does not contain.
+/// - Paths in [`PATHS_NOT_ADVERTISED_IN_MCPL`] (`tools`) contribute nothing even
+///   when literally present: SPEC §5.1 places `tools` only in standard MCP
+///   `capabilities.tools`, so `experimental.mcpl` can never mint it. A caller may
+///   add `tools` only from the outer MCP handshake.
 ///
 /// The result is an *advertisement*, never an authorization: the host intersects it
 /// with policy to produce the grant (§5.4).
@@ -109,6 +113,11 @@ fn walk_advertisement(path: &str, value: &serde_json::Value, out: &mut BTreeSet<
     if !is_capability_path(path) && !has_descendant_paths(path) {
         return;
     }
+    // Paths that live in the outer MCP handshake (`tools`) are never derivable
+    // from `experimental.mcpl`, even when literally present (SPEC §5.1).
+    if PATHS_NOT_ADVERTISED_IN_MCPL.contains(&path) {
+        return;
+    }
 
     match value {
         serde_json::Value::Bool(true) => {
@@ -116,7 +125,9 @@ fn walk_advertisement(path: &str, value: &serde_json::Value, out: &mut BTreeSet<
                 out.insert(path.to_string());
             }
             for leaf in descendant_paths(path) {
-                out.insert(leaf.to_string());
+                if !PATHS_NOT_ADVERTISED_IN_MCPL.contains(leaf) {
+                    out.insert(leaf.to_string());
+                }
             }
         }
         serde_json::Value::Object(obj) => {
@@ -450,10 +461,15 @@ mod tests {
 
     #[test]
     fn tools_is_never_advertised_from_the_mcpl_manifest() {
+        // `tools` lives in MCP `capabilities.tools`, not in `experimental.mcpl`
+        // (SPEC §5.1). Even a literal `"tools": true` in the MCPL manifest mints
+        // nothing; only the outer MCP handshake can contribute it.
         let adv = advertised_capabilities(&json!({ "tools": true }));
-        // `tools` lives in MCP `capabilities.tools`, not in `experimental.mcpl`.
-        // The walk contributes it if literally present, but §5.1 never places it here.
-        assert_eq!(adv.iter().map(String::as_str).collect::<Vec<_>>(), vec!["tools"]);
+        assert!(adv.is_empty(), "unexpected paths: {adv:?}");
+
+        let adv = advertised_capabilities(&json!({ "tools": { "anything": true } }));
+        assert!(adv.is_empty(), "unexpected paths: {adv:?}");
+
         assert!(PATHS_NOT_ADVERTISED_IN_MCPL.contains(&"tools"));
     }
 
