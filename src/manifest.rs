@@ -94,12 +94,6 @@ pub enum Disposition {
 pub enum DigestError {
     #[error("manifest must be a JSON object")]
     NotAnObject,
-    /// A field declared set-like by §17.2 was present but not an array.
-    ///
-    /// The conformance vectors define no code for this case; [`DigestError::code`]
-    /// returns `set_field_not_array`, which is this library's own name.
-    #[error("set-like field `{0}` is not an array")]
-    SetFieldNotArray(String),
     /// A set-like array contained a non-string element. Set ordering is defined
     /// over UTF-8 byte sequences, which only exists for strings.
     #[error("set-like field `{0}` contains a non-string element")]
@@ -125,7 +119,6 @@ impl DigestError {
     pub fn code(&self) -> &'static str {
         match self {
             DigestError::NotAnObject => "manifest_not_object",
-            DigestError::SetFieldNotArray(_) => "set_field_not_array",
             DigestError::SetElementNotString(_) => "set_member_not_string",
             DigestError::IdentifierCharset { .. } => "identifier_charset",
             DigestError::NumberNotRepresentable(_) => "number_not_representable",
@@ -346,7 +339,11 @@ fn check_identifier(position: &str, value: &str) -> Result<(), DigestError> {
 /// `version` and `revision` are not a domain and never contribute.
 ///
 /// Comparison is over the **canonicalized** subtrees, so a reordered `uses` or a
-/// re-serialized object is not reported as a change.
+/// re-serialized object is not reported as a change. An **absent** member and an
+/// **empty** one are *not* equated: they canonicalize differently, so they are
+/// different manifests, and a member appearing or disappearing is a change to its
+/// domain (§17.3) — `featureSets` appearing announces `featureSets` and brings the
+/// `tagOntology` domain into existence with it.
 ///
 /// This is a convenience for a *server* deriving the `domains` of an announcement.
 /// It is **not** a host authorization input: §17.1 makes the host's own diff of the
@@ -376,10 +373,16 @@ pub fn changed_domains(
 struct CanonicalParts {
     /// Every member other than `version`, `revision`, `featureSets`.
     capabilities: String,
-    /// `featureSets` with every `tagOntology` removed.
-    feature_sets: String,
+    /// `featureSets` with every `tagOntology` removed. `None` when the manifest
+    /// has no `featureSets` member at all: absent and empty canonicalize
+    /// differently (§17.2), so they are different manifests — the member appearing
+    /// or disappearing IS a `featureSets` change (§17.3).
+    feature_sets: Option<String>,
     /// Feature-set name → its `tagOntology`, for the sets that declare one.
-    tag_ontologies: std::collections::BTreeMap<String, String>,
+    /// `None` when `featureSets` is absent: the member appearing brings the
+    /// ontology domain into existence with it, so absent → present announces
+    /// `tagOntology` as well.
+    tag_ontologies: Option<std::collections::BTreeMap<String, String>>,
 }
 
 fn canonical_parts(manifest: &Manifest) -> Result<CanonicalParts, DigestError> {
@@ -398,9 +401,9 @@ fn canonical_parts(manifest: &Manifest) -> Result<CanonicalParts, DigestError> {
         }
     }
 
-    let mut tag_ontologies = std::collections::BTreeMap::new();
-    let feature_sets_value = match normalized.get("featureSets") {
+    let (feature_sets, tag_ontologies) = match normalized.get("featureSets") {
         Some(serde_json::Value::Object(declared)) => {
+            let mut tag_ontologies = std::collections::BTreeMap::new();
             let mut feature_sets = serde_json::Map::new();
             for (name, decl) in declared {
                 let mut stripped = decl.clone();
@@ -413,24 +416,30 @@ fn canonical_parts(manifest: &Manifest) -> Result<CanonicalParts, DigestError> {
                 }
                 feature_sets.insert(name.clone(), stripped);
             }
-            serde_json::Value::Object(feature_sets)
+            let mut rendered = String::new();
+            write_jcs(&serde_json::Value::Object(feature_sets), &mut rendered)?;
+            (Some(rendered), Some(tag_ontologies))
         }
         // Not the map shape §5.1/§6.1 defines. Rather than guess where the
         // `tagOntology` members are, report any difference as a `featureSets`
         // change: over-reporting a domain costs a re-fetch, under-reporting hides
         // a narrowing.
-        Some(other) => other.clone(),
-        None => serde_json::Value::Object(serde_json::Map::new()),
+        Some(other) => {
+            let mut rendered = String::new();
+            write_jcs(other, &mut rendered)?;
+            (Some(rendered), Some(std::collections::BTreeMap::new()))
+        }
+        // Absent is not projected to `{}`: the two canonicalize differently, so
+        // `{"version":"0.5"}` → `{"version":"0.5","featureSets":{}}` is a change.
+        None => (None, None),
     };
 
     let mut capabilities_json = String::new();
     write_jcs(&serde_json::Value::Object(capabilities), &mut capabilities_json)?;
-    let mut feature_sets_json = String::new();
-    write_jcs(&feature_sets_value, &mut feature_sets_json)?;
 
     Ok(CanonicalParts {
         capabilities: capabilities_json,
-        feature_sets: feature_sets_json,
+        feature_sets,
         tag_ontologies,
     })
 }
@@ -448,21 +457,18 @@ fn normalize_sets(manifest: &mut serde_json::Value) -> Result<(), DigestError> {
     let Some(feature_sets) = manifest.get_mut("featureSets") else {
         return Ok(());
     };
-    match feature_sets {
-        serde_json::Value::Object(map) => {
-            for (_, decl) in map.iter_mut() {
-                normalize_feature_set(decl)?;
-            }
-        }
-        // RFC-001's examples still show `featureSets` as an array of declarations
-        // carrying `name`; SPEC §5.1/§6.1/§8.1 and RFC-003 use an object map. Both
-        // shapes are normalized so the digest does not depend on which a server used.
-        serde_json::Value::Array(items) => {
-            for decl in items.iter_mut() {
-                normalize_feature_set(decl)?;
-            }
-        }
-        _ => {}
+    // §17.2's set paths are written against the object form's `featureSets.*.uses`
+    // (SPEC §5.1/§6.1/§8.1, RFC-003). Any other shape — including RFC-001's
+    // array-of-declarations example, which was a documented cross-doc error
+    // (corrected 2026-08-02) — is non-conforming and is hashed **verbatim**: no
+    // set normalization and no identifier check applies inside it. Validation is
+    // where the shape fails; the digest's job is to give two implementations the
+    // same answer for the same bytes.
+    let Some(map) = feature_sets.as_object_mut() else {
+        return Ok(());
+    };
+    for (_, decl) in map.iter_mut() {
+        normalize_feature_set(decl)?;
     }
     Ok(())
 }
@@ -488,16 +494,26 @@ fn normalize_feature_set(decl: &mut serde_json::Value) -> Result<(), DigestError
     Ok(())
 }
 
-fn sort_set_field(
+/// Sort one set-valued field of `obj` in place: UTF-8 byte order ascending,
+/// duplicates removed (§17.2 / RFC-003 §3.1).
+///
+/// The digest is **total**: set semantics apply only when the value actually *is*
+/// an array. A wrong-typed value in a set position (`"uses": "tools"`) is left
+/// untouched and hashed verbatim — validation (§6.4 `invalid_uses`) is where wrong
+/// types fail, not the digest.
+///
+/// Public so the shared conformance sort vectors exercise this exact comparator
+/// rather than a test-local reimplementation of it.
+pub fn sort_set_field(
     obj: &mut serde_json::Map<String, serde_json::Value>,
     field: &str,
 ) -> Result<(), DigestError> {
     let Some(value) = obj.get_mut(field) else {
         return Ok(());
     };
-    let array = value
-        .as_array()
-        .ok_or_else(|| DigestError::SetFieldNotArray(field.to_string()))?;
+    let Some(array) = value.as_array() else {
+        return Ok(());
+    };
 
     let mut items: Vec<&str> = Vec::with_capacity(array.len());
     for element in array {
@@ -776,20 +792,42 @@ mod tests {
     }
 
     #[test]
-    fn malformed_set_fields_fail_closed() {
-        let err = manifest_revision(&json!({
+    fn wrong_typed_set_fields_hash_verbatim() {
+        // The digest is total: set semantics apply only when the value actually is
+        // an array. A wrong-typed `uses` is hashed verbatim; §6.4's `invalid_uses`
+        // validation is where it fails, not the digest.
+        let canonical = canonical_manifest_json(&json!({
             "version": "0.5",
             "featureSets": { "f": { "description": "d", "uses": "tools" } }
         }))
-        .unwrap_err();
-        assert_eq!(err, DigestError::SetFieldNotArray("uses".into()));
+        .unwrap();
+        assert!(canonical.contains(r#""uses":"tools""#), "{canonical}");
 
+        // A set-valued *array* carrying a non-string element still fails: set
+        // ordering is defined over UTF-8 byte sequences, which only exist for
+        // strings.
         let err = manifest_revision(&json!({
             "version": "0.5",
             "featureSets": { "f": { "description": "d", "uses": ["tools", 7] } }
         }))
         .unwrap_err();
         assert_eq!(err, DigestError::SetElementNotString("uses".into()));
+    }
+
+    #[test]
+    fn array_form_feature_sets_hash_verbatim() {
+        // RFC-001's array-of-declarations example was a documented cross-doc error
+        // (corrected 2026-08-02). The non-conforming shape is hashed verbatim: no
+        // set normalization inside it — `uses` keeps its input order — and no
+        // identifier check applies in it.
+        let canonical = canonical_manifest_json(&json!({
+            "version": "0.5",
+            "featureSets": [
+                { "name": "f", "description": "d", "uses": ["tools", "pushEvents"] }
+            ]
+        }))
+        .unwrap();
+        assert!(canonical.contains(r#""uses":["tools","pushEvents"]"#), "{canonical}");
     }
 
     #[test]
@@ -962,6 +1000,34 @@ mod tests {
         let mut version = base.clone();
         version["version"] = json!("0.6");
         assert!(changed_domains(&base, &version).unwrap().is_empty());
+    }
+
+    #[test]
+    fn absent_and_empty_feature_sets_are_different_manifests() {
+        // §17.3: absent and empty canonicalize differently, so a member appearing
+        // IS a change to its domain — and `featureSets` appearing brings the
+        // `tagOntology` domain into existence with it.
+        let without = json!({ "version": "0.5" });
+        let with_empty = json!({ "version": "0.5", "featureSets": {} });
+
+        assert_ne!(
+            manifest_revision(&without).unwrap(),
+            manifest_revision(&with_empty).unwrap()
+        );
+        assert_eq!(
+            changed_domains(&without, &with_empty).unwrap(),
+            [ChangeDomain::FeatureSets, ChangeDomain::TagOntology]
+                .into_iter()
+                .collect()
+        );
+        // And symmetrically for the member disappearing.
+        assert_eq!(
+            changed_domains(&with_empty, &without).unwrap(),
+            [ChangeDomain::FeatureSets, ChangeDomain::TagOntology]
+                .into_iter()
+                .collect()
+        );
+        assert!(changed_domains(&with_empty, &with_empty).unwrap().is_empty());
     }
 
     #[test]

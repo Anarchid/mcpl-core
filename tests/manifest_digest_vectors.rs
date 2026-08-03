@@ -17,7 +17,9 @@
 
 use std::collections::BTreeMap;
 
-use mcpl_core::manifest::{canonical_manifest_json, manifest_revision, DigestError};
+use mcpl_core::manifest::{
+    canonical_manifest_json, manifest_revision, sort_set_field, DigestError,
+};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -144,13 +146,11 @@ fn every_set_sort_vector_matches() {
 
     for vector in &vectors {
         let name = name(vector);
-        let input: Vec<&str> = vector
+        let input = vector
             .get("input")
             .and_then(|v| v.as_array())
             .unwrap_or_else(|| panic!("sort vector {name} has no `input` array"))
-            .iter()
-            .map(|v| v.as_str().expect("sort vector inputs are strings"))
-            .collect();
+            .clone();
         let expected: Vec<&str> = vector
             .get("sorted")
             .and_then(|v| v.as_array())
@@ -159,12 +159,20 @@ fn every_set_sort_vector_matches() {
             .map(|v| v.as_str().expect("sort vector outputs are strings"))
             .collect();
 
-        // The comparator §17.2 mandates: UTF-8 byte sequence, ascending, deduped.
-        // Rust's `str: Ord` is exactly that, which is the point of the rule — it is
-        // the JavaScript side that must avoid its default UTF-16 comparator.
-        let mut actual = input.clone();
-        actual.sort_unstable();
-        actual.dedup();
+        // Run the vector through the *library's* set comparator — the one the
+        // digest itself uses (§17.2: UTF-8 byte sequence, ascending, deduped) —
+        // not a test-local re-sort, which would pass without exercising any
+        // library code.
+        let mut obj = serde_json::Map::new();
+        obj.insert("uses".to_string(), Value::Array(input));
+        sort_set_field(&mut obj, "uses")
+            .unwrap_or_else(|e| panic!("sort vector {name}: unexpected error {e}"));
+        let actual: Vec<&str> = obj["uses"]
+            .as_array()
+            .expect("sort_set_field keeps the field an array")
+            .iter()
+            .map(|v| v.as_str().expect("sort vector inputs are strings"))
+            .collect();
 
         assert_eq!(actual, expected, "sort vector {name}");
     }

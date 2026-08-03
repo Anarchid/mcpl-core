@@ -69,37 +69,126 @@ pub struct FeatureSetsUpdateParams {
 /// The response to `featureSets/update` is a **degradation receipt**, not an
 /// acknowledgement (SPEC §6.7).
 ///
+/// The two outcomes carry different obligations, so they are different types.
+/// §6.7: "`fallback` is REQUIRED when `accepted` is `false`" — a refusal names its
+/// own consequence rather than leaving the host to guess between mcp-only and
+/// closing the transport — while an acceptance carries no `fallback` at all. The
+/// split makes the requiredness structural instead of a runtime check.
+///
 /// Consequence testimony is not policy authority: the receipt reports what the
 /// server *will do*, never what it is *entitled to*. A host MUST NOT widen any grant
 /// in response to a receipt, and a refusal MUST NOT reach the policy engine as an
 /// input.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct FeatureSetsUpdateResult {
-    pub accepted: bool,
+///
+/// On the wire both forms are one object distinguished by the `accepted` boolean,
+/// which is what the manual `Serialize`/`Deserialize` implementations below encode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FeatureSetsUpdateResult {
+    /// `accepted: true`.
+    Accepted(AcceptedUpdate),
+    /// `accepted: false`.
+    Refused(RefusedUpdate),
+}
+
+/// The `accepted: true` receipt (§6.7).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AcceptedUpdate {
     /// e.g. `"degraded"`. The specification shows this value but defines no closed
-    /// enum, so it is left as a free string.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// enum, so it is left as a free string. §6.7: when nothing degraded, **omit**
+    /// it rather than inventing a value.
     pub mode: Option<String>,
+    pub unavailable_features: Option<Vec<UnavailableFeature>>,
+    pub notes: Option<Vec<String>>,
+}
+
+/// The `accepted: false` refusal receipt (§6.7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefusedUpdate {
+    /// Which weaker outcome applies. **Required** (§6.7): naming the consequence is
+    /// the server's job, and its absence would be a silent value at exactly the
+    /// point the host chooses between mcp-only and closing the transport.
+    /// `accepted: false` does **not** mean close the transport; the host MAY close
+    /// regardless.
+    pub fallback: UpdateFallback,
+    pub missing_capabilities: Option<Vec<String>>,
+    pub reason: Option<String>,
+}
+
+/// The wire shape shared by both receipt forms.
+#[derive(Serialize, Deserialize)]
+struct FeatureSetsUpdateResultWire {
+    accepted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mode: Option<String>,
     #[serde(
         rename = "unavailableFeatures",
         default,
         skip_serializing_if = "Option::is_none"
     )]
-    pub unavailable_features: Option<Vec<UnavailableFeature>>,
+    unavailable_features: Option<Vec<UnavailableFeature>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub notes: Option<Vec<String>>,
-    /// On refusal: which weaker outcome applies. `accepted: false` does **not** mean
-    /// close the transport (§6.7); the host MAY close regardless.
+    notes: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fallback: Option<UpdateFallback>,
+    fallback: Option<UpdateFallback>,
     #[serde(
         rename = "missingCapabilities",
         default,
         skip_serializing_if = "Option::is_none"
     )]
-    pub missing_capabilities: Option<Vec<String>>,
+    missing_capabilities: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
+    reason: Option<String>,
+}
+
+impl Serialize for FeatureSetsUpdateResult {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let wire = match self {
+            FeatureSetsUpdateResult::Accepted(a) => FeatureSetsUpdateResultWire {
+                accepted: true,
+                mode: a.mode.clone(),
+                unavailable_features: a.unavailable_features.clone(),
+                notes: a.notes.clone(),
+                fallback: None,
+                missing_capabilities: None,
+                reason: None,
+            },
+            FeatureSetsUpdateResult::Refused(r) => FeatureSetsUpdateResultWire {
+                accepted: false,
+                mode: None,
+                unavailable_features: None,
+                notes: None,
+                fallback: Some(r.fallback),
+                missing_capabilities: r.missing_capabilities.clone(),
+                reason: r.reason.clone(),
+            },
+        };
+        wire.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for FeatureSetsUpdateResult {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = FeatureSetsUpdateResultWire::deserialize(deserializer)?;
+        if wire.accepted {
+            Ok(FeatureSetsUpdateResult::Accepted(AcceptedUpdate {
+                mode: wire.mode,
+                unavailable_features: wire.unavailable_features,
+                notes: wire.notes,
+            }))
+        } else {
+            // §6.7: `fallback` is REQUIRED when `accepted` is `false`.
+            let fallback = wire.fallback.ok_or_else(|| {
+                serde::de::Error::custom(
+                    "refusal receipt (`accepted: false`) is missing required `fallback` (§6.7)",
+                )
+            })?;
+            Ok(FeatureSetsUpdateResult::Refused(RefusedUpdate {
+                fallback,
+                missing_capabilities: wire.missing_capabilities,
+                reason: wire.reason,
+            }))
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -116,9 +205,9 @@ pub struct UnavailableFeature {
     pub feature_set: String,
     #[serde(rename = "missingCapabilities", default)]
     pub missing_capabilities: Vec<String>,
-    /// e.g. `"disabled"`. No closed enum is specified.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub effect: Option<String>,
+    /// e.g. `"disabled"`. No closed enum is specified, but §6.7 makes it
+    /// **required**: "Each `unavailableFeatures` entry MUST carry `effect`."
+    pub effect: String,
 }
 
 // ── Section 7 (Scoped Access) is removed in 0.5.0 ──
@@ -979,5 +1068,73 @@ mod tests {
         let bad: FeatureSetDeclaration =
             serde_json::from_value(serde_json::json!({ "description": "Demo" })).unwrap();
         assert!(crate::grant::validate_uses(&bad.uses).is_err());
+    }
+
+    #[test]
+    fn refusal_receipt_requires_fallback() {
+        // §6.7: "`fallback` is REQUIRED when `accepted` is `false`" — the refusal
+        // names its own consequence.
+        let refused: FeatureSetsUpdateResult = serde_json::from_value(serde_json::json!({
+            "accepted": false,
+            "fallback": "mcp-only",
+            "missingCapabilities": ["inferenceLifecycle"],
+            "reason": "cannot operate without lifecycle"
+        }))
+        .unwrap();
+        let FeatureSetsUpdateResult::Refused(r) = &refused else {
+            panic!("accepted: false must deserialize as Refused");
+        };
+        assert_eq!(r.fallback, UpdateFallback::McpOnly);
+
+        // A refusal that names no fallback is malformed, not a silent default.
+        assert!(serde_json::from_value::<FeatureSetsUpdateResult>(serde_json::json!({
+            "accepted": false,
+            "reason": "no consequence named"
+        }))
+        .is_err());
+
+        // An acceptance carries no fallback at all — structurally.
+        let accepted: FeatureSetsUpdateResult =
+            serde_json::from_value(serde_json::json!({ "accepted": true })).unwrap();
+        assert!(matches!(accepted, FeatureSetsUpdateResult::Accepted(_)));
+        let wire = serde_json::to_value(&accepted).unwrap();
+        assert_eq!(wire.get("accepted"), Some(&serde_json::Value::Bool(true)));
+        assert!(wire.get("fallback").is_none());
+        // §6.7: when nothing degraded, `mode` is omitted, not invented.
+        assert!(wire.get("mode").is_none());
+
+        // Round trip of the refusal keeps the wire shape.
+        let wire = serde_json::to_value(&refused).unwrap();
+        assert_eq!(wire.get("accepted"), Some(&serde_json::Value::Bool(false)));
+        assert_eq!(wire.get("fallback"), Some(&serde_json::json!("mcp-only")));
+    }
+
+    #[test]
+    fn unavailable_feature_entries_require_effect() {
+        // §6.7: "Each `unavailableFeatures` entry MUST carry `effect`."
+        let receipt: FeatureSetsUpdateResult = serde_json::from_value(serde_json::json!({
+            "accepted": true,
+            "mode": "degraded",
+            "unavailableFeatures": [
+                { "featureSet": "memory.extraction",
+                  "missingCapabilities": ["inferenceLifecycle"],
+                  "effect": "disabled" }
+            ],
+            "notes": []
+        }))
+        .unwrap();
+        let FeatureSetsUpdateResult::Accepted(a) = &receipt else {
+            panic!("accepted: true must deserialize as Accepted");
+        };
+        assert_eq!(
+            a.unavailable_features.as_ref().unwrap()[0].effect,
+            "disabled"
+        );
+
+        assert!(serde_json::from_value::<UnavailableFeature>(serde_json::json!({
+            "featureSet": "memory.extraction",
+            "missingCapabilities": ["inferenceLifecycle"]
+        }))
+        .is_err());
     }
 }

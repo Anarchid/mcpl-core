@@ -147,6 +147,21 @@ fn descendant_paths(prefix: &str) -> impl Iterator<Item = &'static &'static str>
 
 // ── The capability grant (§5.4) ───────────────────────────────────────────────
 
+/// The JSON-RPC carrier of a `featureSets/update` (SPEC §6.7).
+///
+/// The form is authorization-relevant, not a transport detail: only a Request —
+/// which the host must answer with a receipt — can alter the effective grant. See
+/// [`CapabilityGrant::from_update`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateForm {
+    /// Carries an `id` and is answered by a degradation receipt. Required for any
+    /// change to the effective grant, including the initial policy (§5.3).
+    Request,
+    /// Unacknowledged. Valid only for purely descriptive feature metadata; cannot
+    /// alter the grant or establish a ready state.
+    Notification,
+}
+
 #[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
 pub enum GrantError {
     /// §5.4: "If a path appears in both, the receiving side MUST fail closed and
@@ -187,15 +202,32 @@ impl CapabilityGrant {
     /// Build a grant from a `featureSets/update` policy message, applying the §5.4
     /// fail-closed check that no path appears in both lists.
     ///
-    /// Returns `Ok(None)` when `effectiveCapabilities` is absent: §6.7 permits a
-    /// Notification carrying purely descriptive feature metadata that does not alter
-    /// the grant. Such a message MUST NOT be read as granting or revoking anything,
-    /// and MUST NOT establish a ready state.
+    /// The meaning of an absent `effectiveCapabilities` depends on the JSON-RPC
+    /// **form** the message arrived in (§6.7), so the caller must say which:
+    ///
+    /// - [`UpdateForm::Request`] is a change to the effective grant, and the
+    ///   allowlist is total: absent `effectiveCapabilities` is a grant of
+    ///   **nothing** — `Ok(Some(empty))`, deny-all. Treating it as no-alteration
+    ///   would leave a stale wider grant standing, the §6.7 hole class.
+    /// - [`UpdateForm::Notification`] never alters the grant — `Ok(None)`,
+    ///   regardless of what the message carries. §6.7 (pinned 2026-08-02): a
+    ///   non-conforming Notification's `effectiveCapabilities`, `enabled`, and any
+    ///   widening are discarded with a diagnostic, because honouring them would
+    ///   have the server acting on a path the host cannot know it accepted; only a
+    ///   narrowing `disabled` list is respected, and that is a *feature-set*
+    ///   reduction applied by the caller, not a grant alteration. A Notification
+    ///   MUST NOT establish a ready state.
     pub fn from_update(
         params: &crate::methods::FeatureSetsUpdateParams,
+        form: UpdateForm,
     ) -> Result<Option<Self>, GrantError> {
-        let Some(effective) = params.effective_capabilities.as_ref() else {
+        if form == UpdateForm::Notification {
             return Ok(None);
+        }
+        let Some(effective) = params.effective_capabilities.as_ref() else {
+            // Request form: the absent allowlist grants nothing (§5.4: absence is
+            // the denial), it does not preserve the previous grant.
+            return Ok(Some(Self::empty()));
         };
         if let Some(denied) = params.denied_capabilities.as_ref() {
             let denied_set: BTreeSet<&str> = denied.iter().map(String::as_str).collect();
@@ -450,9 +482,26 @@ mod tests {
             disabled: None,
         };
         assert_eq!(
-            CapabilityGrant::from_update(&params),
+            CapabilityGrant::from_update(&params, UpdateForm::Request),
             Err(GrantError::PathInBothLists("channels.publish".into()))
         );
+    }
+
+    #[test]
+    fn request_without_effective_capabilities_grants_nothing() {
+        // §6.7: the Request form is a change to the effective grant and the
+        // allowlist is total — absence is deny-all, never "keep the old grant".
+        let params = crate::methods::FeatureSetsUpdateParams {
+            effective_capabilities: None,
+            denied_capabilities: None,
+            enabled: None,
+            disabled: None,
+        };
+        let grant = CapabilityGrant::from_update(&params, UpdateForm::Request)
+            .unwrap()
+            .expect("a Request always yields a grant");
+        assert_eq!(grant, CapabilityGrant::empty());
+        assert!(!grant.allows("channels.publish"));
     }
 
     #[test]
@@ -463,7 +512,29 @@ mod tests {
             enabled: Some(vec!["memory.retrieval".into()]),
             disabled: None,
         };
-        assert_eq!(CapabilityGrant::from_update(&params), Ok(None));
+        assert_eq!(
+            CapabilityGrant::from_update(&params, UpdateForm::Notification),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn notification_never_alters_the_grant() {
+        // §6.7 (pinned 2026-08-02): a non-conforming Notification carrying
+        // `effectiveCapabilities` is discarded with a diagnostic — honouring a
+        // widening from an unacknowledgeable message would have the server acting
+        // on a path the host cannot know it accepted. Only a narrowing `disabled`
+        // list is respected, at the feature-set level, by the caller.
+        let params = crate::methods::FeatureSetsUpdateParams {
+            effective_capabilities: Some(vec!["channels.publish".into(), "tools".into()]),
+            denied_capabilities: None,
+            enabled: Some(vec!["memory.retrieval".into()]),
+            disabled: Some(vec!["memory.extraction".into()]),
+        };
+        assert_eq!(
+            CapabilityGrant::from_update(&params, UpdateForm::Notification),
+            Ok(None)
+        );
     }
 
     #[test]
